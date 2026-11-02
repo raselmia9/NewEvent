@@ -1,4 +1,4 @@
-name: Scrape Proximity Match Cards
+name: Scrape Match Server Metadata
 
 on:
   workflow_dispatch:
@@ -9,51 +9,45 @@ permissions:
   contents: write
 
 concurrency:
-  group: proximity-match-scraper
+  group: proximity-stage2
   cancel-in-progress: false
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
+    timeout-minutes: 20
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: "pip"
+          cache: pip
 
-      - name: Install dependencies
+      - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements-stage2.txt
           python -m playwright install --with-deps chromium
 
-      - name: Run scraper
-        run: python scraper.py
+      - name: Scrape server metadata
+        run: python scraper_stage2.py
 
-      - name: Upload diagnostics
+      - name: Upload output
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: proximity-scraper-debug
-          path: |
-            debug.json
-            matches.json
+          name: match-server-metadata
+          path: matches_with_channels.json
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Commit updated JSON
+      - name: Commit output
         run: |
-          if [ -f matches.json ]; then
+          if [ -f matches_with_channels.json ]; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add matches.json
-            git diff --cached --quiet || git commit -m "Update match data"
+            git add matches_with_channels.json
+            git diff --cached --quiet || git commit -m "Update match server metadata"
             git push
           fi
-
