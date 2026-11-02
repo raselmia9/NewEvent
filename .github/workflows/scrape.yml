@@ -35,8 +35,28 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
+      - name: Check Input JSON
+        run: |
+          if [ ! -f matches.json ]; then
+            echo "ERROR: matches.json not found!"
+            exit 1
+          fi
+
+          python -m json.tool matches.json > /dev/null
+          echo "JSON file validated successfully."
+
       - name: Run Scraper
         run: python scraper.py
+
+      - name: Validate Output JSON
+        run: |
+          if [ -f matches_with_channels.json ]; then
+            python -m json.tool matches_with_channels.json > /dev/null
+            echo "Output JSON validated successfully."
+          else
+            echo "ERROR: Output JSON not found!"
+            exit 1
+          fi
 
       - name: Upload JSON Result
         if: always()
@@ -46,16 +66,26 @@ jobs:
           path: |
             matches.json
             matches_with_channels.json
-          if-no-files-found: warnl
+          if-no-files-found: warn
           retention-days: 7
 
       - name: Commit Updated JSON
+        if: success()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add matches.json matches_with_channels.json
+          if [ -f matches.json ]; then
+            git add matches.json
+          fi
 
-          git diff --cached --quiet || git commit -m "Update match data"
+          if [ -f matches_with_channels.json ]; then
+            git add matches_with_channels.json
+          fi
 
-          git push
+          if ! git diff --cached --quiet; then
+            git commit -m "Update match data"
+            git push
+          else
+            echo "No changes to commit."
+          fi
