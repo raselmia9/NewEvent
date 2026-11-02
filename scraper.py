@@ -1,220 +1,159 @@
 import asyncio
 import json
 import re
-from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
-
+from urllib.parse import urljoin
 from playwright.async_api import async_playwright
 
-SITE_URL = "https://proximitybd-mominrocks.lovable.app/"
-OUT_FILE = Path("matches.json")
-DEBUG_FILE = Path("debug.json")
+INPUT_FILE = Path("matches.json")
+OUTPUT_FILE = Path("matches_with_channels.json")
+SITE_BASE = "https://proximitybd-mominrocks.lovable.app/"
+TIMEOUT_MS = 45000
 
-DATE_RE = re.compile(
-    r"(Mon|Tue|Wed|Thu|Fri|Sat|Sun)?[,]?\s*"
-    r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}"
-    r".{0,30}?\d{1,2}:\d{2}\s*(AM|PM)?",
-    re.I,
-)
-STATUS_WORDS = ("LIVE", "UPCOMING", "ENDED")
-SPORT_WORDS = (
-    "CRICKET", "FOOTBALL", "TENNIS", "BASKETBALL", "HOCKEY",
-    "RUGBY", "BADMINTON", "VOLLEYBALL", "BASEBALL"
-)
+PLAYER_NAMES = ["Shaka", "Clappr", "dash.js", "Video.js"]
+STATUS_WORDS = ["ONLINE", "OFFLINE", "LIVE", "UNAVAILABLE"]
 
 
-def clean(value):
-    return re.sub(r"\s+", " ", value or "").strip()
+def clean(s):
+    return re.sub(r"\s+", " ", s or "").strip()
 
 
-def absolute_url(value, base):
-    if not value:
-        return ""
-    return urljoin(base, value.strip())
+async def inspect_match_page(page):
+    """Read visible server cards/buttons and their public page links only."""
+    return await page.evaluate(
+        """({playerNames, statusWords}) => {
+          const clean = s => (s || '').replace(/\\\\s+/g, ' ').trim();
+          const visible = el => {
+            const r = el.getBoundingClientRect();
+            const st = getComputedStyle(el);
+            return r.width > 0 && r.height > 0 &&
+                   st.display !== 'none' && st.visibility !== 'hidden';
+          };
 
+          const headings = [...document.querySelectorAll('h1,h2,h3,h4,div,span')]
+            .filter(visible)
+            .filter(el => clean(el.textContent).toUpperCase() === 'SERVERS')
+            .sort((a,b) => a.querySelectorAll('*').length - b.querySelectorAll('*').length);
 
-async def inspect_page(page):
-    # Read cards from the rendered DOM. The selectors are intentionally
-    # heuristic until the site's exact DOM/API has been confirmed.
-    return await page.evaluate(r"""() => {
-      const clean = s => (s || '').replace(/\s+/g, ' ').trim();
-      const visible = el => {
-        const r = el.getBoundingClientRect();
-        const st = getComputedStyle(el);
-        return r.width > 0 && r.height > 0 &&
-               st.display !== 'none' && st.visibility !== 'hidden';
-      };
-      const dateRe = /(Mon|Tue|Wed|Thu|Fri|Sat|Sun)?[,]?\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}.{0,30}?\d{1,2}:\d{2}\s*(AM|PM)?/i;
-      const sports = ['CRICKET','FOOTBALL','TENNIS','BASKETBALL','HOCKEY','RUGBY','BADMINTON','VOLLEYBALL','BASEBALL'];
-      const statusWords = ['LIVE','UPCOMING','ENDED'];
-      const found = [];
-      const seen = new Set();
+          let root = headings.length ? headings[0].parentElement : document.body;
+          // Walk upward until a reasonably sized container includes several server-like cards.
+          for (let i=0; i<4 && root.parentElement; i++) {
+            const txt = clean(root.innerText).toUpperCase();
+            if (txt.includes('ONLINE') || txt.includes('OFFLINE')) break;
+            root = root.parentElement;
+          }
 
-      // Card candidates: elements with at least two images and a date/time.
-      const all = Array.from(document.querySelectorAll('a, article, li, div'))
-        .filter(visible)
-        .filter(el => {
-          const imgs = el.querySelectorAll('img');
-          if (imgs.length < 2) return false;
-          const txt = clean(el.innerText);
-          return dateRe.test(txt) && txt.length < 1800;
-        })
-        .sort((a,b) => {
-          const aa = a.querySelectorAll('img').length;
-          const bb = b.querySelectorAll('img').length;
-          return aa - bb;
-        });
+          const candidates = [...root.querySelectorAll('button,a,[role="button"],[tabindex]')]
+            .filter(visible)
+            .filter(el => {
+              const t = clean(el.innerText || el.getAttribute('aria-label'));
+              return t.length > 1 && t.length < 180 &&
+                     !playerNames.some(p => t.toLowerCase() === p.toLowerCase());
+            });
 
-      for (const el of all) {
-        // Prefer the smallest qualifying ancestor/card.
-        const imgs = Array.from(el.querySelectorAll('img')).filter(visible);
-        const text = clean(el.innerText);
-        const key = text + '|' + imgs.map(i => i.currentSrc || i.src).join('|');
-        if (seen.has(key)) continue;
-        seen.add(key);
+          const servers = [];
+          const seen = new Set();
+          for (const el of candidates) {
+            const text = clean(el.innerText || el.getAttribute('aria-label'));
+            const parent = el.closest('a,button,[role="button"]') || el;
+            const card = parent.parentElement || parent;
+            const cardText = clean(card.innerText || text);
+            const key = text + '|' + cardText;
+            if (seen.has(key)) continue;
+            seen.add(key);
 
-        const anchor = el.matches('a') ? el : el.querySelector('a[href]');
-        const href = anchor ? anchor.getAttribute('href') : '';
-        const imgData = imgs.slice(0, 4).map(i => ({
-          src: i.currentSrc || i.src || i.getAttribute('data-src') || '',
-          alt: clean(i.alt)
-        }));
+            const href = parent.getAttribute('href') || '';
+            const status = statusWords.find(s => cardText.toUpperCase().includes(s)) || '';
+            const code = (cardText.match(/\\\\b[A-Z0-9]{2,8}\\\\b/) || [])[0] || '';
+            servers.push({
+              name: text.split('\\n')[0],
+              visible_text: cardText,
+              status,
+              code,
+              public_href: href,
+              element_tag: parent.tagName.toLowerCase(),
+              class_name: String(parent.className || '').slice(0,180)
+            });
+          }
 
-        const lines = (el.innerText || '').split('\n').map(clean).filter(Boolean);
-        const category = lines.find(x => sports.includes(x.toUpperCase())) || '';
-        const status = statusWords.find(x => text.toUpperCase().includes(x)) || '';
-        const dateMatch = text.match(dateRe);
-        const title = lines.find(x =>
-          x.length > 5 &&
-          x !== category &&
-          !statusWords.includes(x.toUpperCase()) &&
-          !dateRe.test(x) &&
-          !/^\d+$/.test(x)
-        ) || '';
+          const players = [...document.querySelectorAll('button,[role="tab"],a')]
+            .filter(visible)
+            .map(el => clean(el.innerText || el.getAttribute('aria-label')))
+            .filter(t => playerNames.some(p => t.toLowerCase() === p.toLowerCase()));
 
-        found.push({
-          title, category, date: dateMatch ? clean(dateMatch[0]) : '',
-          status, link: href, images: imgData,
-          text, tag: el.tagName.toLowerCase(),
-          className: String(el.className || '').slice(0, 250)
-        });
-      }
-
-      const resources = performance.getEntriesByType('resource')
-        .map(x => x.name)
-        .filter(x => /(api|graphql|supabase|firebase|event|match|json)/i.test(x))
-        .slice(-250);
-
-      return {
-        pageTitle: document.title,
-        pageUrl: location.href,
-        bodyText: clean(document.body.innerText).slice(0, 12000),
-        cards: found,
-        resources,
-        imageCount: document.images.length,
-        anchorCount: document.querySelectorAll('a[href]').length
-      };
-    }""")
+          return {
+            title: clean(document.querySelector('h1')?.innerText || document.title),
+            players: [...new Set(players)],
+            servers,
+            page_url: location.href
+          };
+        }""",
+        {"playerNames": PLAYER_NAMES, "statusWords": STATUS_WORDS}
+    )
 
 
 async def main():
-    debug = {
-        "site": SITE_URL,
-        "checked_at_utc": datetime.now(timezone.utc).isoformat(),
-        "network_json_responses": [],
-        "errors": []
-    }
-    matches = []
+    if not INPUT_FILE.exists():
+        raise SystemExit("matches.json is missing. Put the first-stage output beside scraper_stage2.py")
+
+    matches = json.loads(INPUT_FILE.read_text(encoding="utf-8"))
+    if not isinstance(matches, list):
+        raise SystemExit("matches.json must contain a JSON array")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
-            viewport={"width": 1440, "height": 1100},
+            viewport={"width": 1365, "height": 1000},
             user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                         "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
         )
         page = await context.new_page()
 
-        async def on_response(response):
+        for index, match in enumerate(matches, start=1):
+            match_url = match.get("link") or ""
+            if not match_url:
+                match["channels"] = []
+                match["scrape_note"] = "Missing match link"
+                continue
+
             try:
-                ctype = (response.headers.get("content-type") or "").lower()
-                if "json" in ctype:
-                    body = await response.json()
-                    debug["network_json_responses"].append({
-                        "url": response.url,
-                        "status": response.status,
-                        "sample": body if isinstance(body, (dict, list)) else str(body)[:1000]
+                await page.goto(urljoin(SITE_BASE, match_url), wait_until="domcontentloaded",
+                                timeout=TIMEOUT_MS)
+                await page.wait_for_timeout(2500)
+                details = await inspect_match_page(page)
+
+                channels = []
+                for server in details.get("servers", []):
+                    href = server.get("public_href", "")
+                    channels.append({
+                        "name": server.get("name", ""),
+                        "status": server.get("status", ""),
+                        "code": server.get("code", ""),
+                        "player_options": details.get("players", []),
+                        # Only explicit public page/navigation links are retained.
+                        "page_link": urljoin(page.url, href) if href else ""
                     })
-            except Exception:
-                pass
 
-        page.on("response", on_response)
+                match["channels"] = channels
+                match["detail_page_title"] = details.get("title", "")
+                match["scrape_note"] = (
+                    "Server button metadata collected. Protected media manifests, "
+                    "DRM license data and decryption keys are not collected."
+                )
+                print(f"[{index}/{len(matches)}] {match.get('title','(untitled)')}: "
+                      f"{len(channels)} server entries")
+            except Exception as exc:
+                match["channels"] = []
+                match["scrape_note"] = f"Page inspection failed: {type(exc).__name__}: {exc}"
+                print(f"[{index}/{len(matches)}] ERROR: {exc}")
 
-        try:
-            await page.goto(SITE_URL, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(12000)
+        await browser.close()
 
-            # Scroll progressively to trigger lazy-loaded event cards.
-            for _ in range(8):
-                await page.evaluate("window.scrollBy(0, Math.max(600, window.innerHeight * 0.8))")
-                await page.wait_for_timeout(900)
-            await page.evaluate("window.scrollTo(0, 0)")
-            await page.wait_for_timeout(1500)
-
-            snapshot = await inspect_page(page)
-            debug["page"] = snapshot
-
-            for item in snapshot.get("cards", []):
-                imgs = item.get("images", [])
-                if not item.get("title") and not imgs:
-                    continue
-
-                image_urls = [
-                    absolute_url(x.get("src", ""), SITE_URL)
-                    for x in imgs if x.get("src")
-                ]
-
-                # First two images are treated as team logos. This will be
-                # refined once the site's exact card DOM is inspected.
-                matches.append({
-                    "title": item.get("title", ""),
-                    "team1_logo": image_urls[0] if len(image_urls) > 0 else "",
-                    "team2_logo": image_urls[1] if len(image_urls) > 1 else "",
-                    "date": item.get("date", ""),
-                    "category": item.get("category", ""),
-                    "status": item.get("status", ""),
-                    "link": absolute_url(item.get("link", ""), SITE_URL)
-                })
-
-        except Exception as exc:
-            debug["errors"].append(repr(exc))
-        finally:
-            await browser.close()
-
-    # Remove duplicate records while preserving order.
-    unique = []
-    seen = set()
-    for row in matches:
-        key = (row["title"], row["date"], row["link"])
-        if key not in seen:
-            seen.add(key)
-            unique.append(row)
-
-    OUT_FILE.write_text(
-        json.dumps(unique, ensure_ascii=False, indent=2),
+    OUTPUT_FILE.write_text(
+        json.dumps(matches, ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
-    DEBUG_FILE.write_text(
-        json.dumps(debug, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8"
-    )
-
-    print(f"Scraped {len(unique)} candidate cards.")
-    print(f"Saved: {OUT_FILE} and {DEBUG_FILE}")
-    if not unique:
-        print("No cards detected yet. Check debug.json for rendered page text,")
-        print("network JSON responses, resource URLs, and DOM diagnostics.")
+    print(f"Saved {OUTPUT_FILE}")
 
 
 if __name__ == "__main__":
