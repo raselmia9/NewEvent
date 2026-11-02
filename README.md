@@ -1,24 +1,16 @@
-# Proximity Match Scraper
+# Stage 2: Match server metadata
 
-Python + Playwright scraper for:
-https://proximitybd-mominrocks.lovable.app/
+Put `matches.json` (the first-stage output) in the repository root.
 
-## Files
-- `scraper.py`: loads the site, inspects rendered cards and captures JSON network responses.
-- `matches.json`: extracted match data.
-- `debug.json`: diagnostic snapshot used to identify the site's real DOM/API.
-- `.github/workflows/scrape.yml`: scheduled GitHub Actions workflow (every 15 minutes).
+This stage opens each match detail page and records visible server button labels,
+visible status text, player option labels, and explicit public page/navigation hrefs.
 
-## First run
-1. Upload these files to the root of a GitHub repository.
-2. Open **Actions** and enable workflows if GitHub asks.
-3. Run **Scrape Proximity Match Cards** manually once.
-4. Download the `proximity-scraper-debug` artifact.
-5. Share `debug.json` here so the selectors/API can be made exact.
+It does not click stream launch controls and does not inspect or collect protected
+media manifests, DRM license data, or decryption keys.
 
-## Important
-The website's public text rendering currently reports zero events, while the supplied screenshot shows 47.
-This first version is therefore a discovery/diagnostic scraper. Its DOM card detection is heuristic,
-not yet a confirmed site-specific selector. The debug artifact will show what Playwright actually sees
-in GitHub Actions, including resource URLs and JSON responses. Do not treat an empty `matches.json`
-as proof that the website has no events.
+Run locally:
+    pip install -r requirements-stage2.txt
+    playwright install chromium
+    python scraper_stage2.py
+
+GitHub Actions runs every 15 minutes or manually via Actions > Run workflow.
